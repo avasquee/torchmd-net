@@ -93,7 +93,7 @@ def train_val_test_split(dset_len, train_size, val_size, test_size, seed, order=
     if total < dset_len:
         rank_zero_warn(f"{dset_len - total} samples were excluded from the dataset")
 
-    idxs = np.arange(dset_len, dtype=np.int)
+    idxs = np.arange(dset_len, dtype=int)
     if order is None:
         idxs = np.random.default_rng(seed).permutation(idxs)
 
@@ -183,12 +183,18 @@ class LoadFromCheckpoint(argparse.Action):
 
 
 def save_argparse(args, filename, exclude=None):
+    import json
+
     if filename.endswith("yaml") or filename.endswith("yml"):
         if isinstance(exclude, str):
             exclude = [exclude]
         args = args.__dict__.copy()
         for exl in exclude:
             del args[exl]
+
+        ds_arg = args.get("dataset_arg")
+        if ds_arg is not None and isinstance(ds_arg, str):
+            args["dataset_arg"] = json.loads(args["dataset_arg"])
         yaml.dump(args, open(filename, "w"))
     else:
         raise ValueError("Configuration file should end with yaml or yml")

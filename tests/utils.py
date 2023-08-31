@@ -4,9 +4,16 @@ import torch
 from torch_geometric.data import Dataset, Data
 
 
-def load_example_args(model_name, remove_prior=False, **kwargs):
-    with open(join(dirname(dirname(__file__)), "examples", "ET-QM9.yaml"), "r") as f:
+def load_example_args(model_name, remove_prior=False, config_file=None, **kwargs):
+    if config_file is None:
+        if model_name == "tensornet":
+            config_file = join(dirname(dirname(__file__)), "examples", "TensorNet-QM9.yaml")
+        else:
+            config_file = join(dirname(dirname(__file__)), "examples", "ET-QM9.yaml")
+    with open(config_file, "r") as f:
         args = yaml.load(f, Loader=yaml.FullLoader)
+    if "precision" not in args:
+        args["precision"] = 32
     args["model"] = model_name
     args["seed"] = 1234
     if remove_prior:
@@ -32,8 +39,6 @@ def create_example_batch(n_atoms=6, multiple_batches=True):
 class DummyDataset(Dataset):
     def __init__(
         self,
-        dataset_root=None,
-        dataset_arg=None,
         num_samples=1000,
         energy=True,
         forces=True,
@@ -71,13 +76,16 @@ class DummyDataset(Dataset):
                 return self.atomref
 
             DummyDataset.get_atomref = _get_atomref
+        self.atomic_number = torch.arange(max(atom_types)+1)
+        self.distance_scale = 1.0
+        self.energy_scale = 1.0
 
     def get(self, idx):
         features = dict(z=self.z[idx].clone(), pos=self.pos[idx].clone())
         if self.energies is not None:
             features["y"] = self.energies[idx].clone()
         if self.forces is not None:
-            features["dy"] = self.forces[idx].clone()
+            features["neg_dy"] = self.forces[idx].clone()
         return Data(**features)
 
     def len(self):

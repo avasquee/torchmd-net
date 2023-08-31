@@ -6,8 +6,37 @@ from torch_geometric.loader import DataLoader
 from pytorch_lightning import LightningDataModule
 from pytorch_lightning.utilities import rank_zero_warn
 from torchmdnet import datasets
+from torch_geometric.data import Dataset
 from torchmdnet.utils import make_splits, MissingEnergyException
 from torch_scatter import scatter
+from torchmdnet.models.utils import dtype_mapping
+
+
+class FloatCastDatasetWrapper(Dataset):
+    def __init__(self, dataset, dtype=torch.float64):
+        super(FloatCastDatasetWrapper, self).__init__(
+            dataset.root, dataset.transform, dataset.pre_transform, dataset.pre_filter
+        )
+        self.dataset = dataset
+        self.dtype = dtype
+
+    def len(self):
+        return len(self.dataset)
+
+    def get(self, idx):
+        data = self.dataset.get(idx)
+        for key, value in data:
+            if torch.is_tensor(value) and torch.is_floating_point(value):
+                setattr(data, key, value.to(self.dtype))
+        return data
+
+    def __getattr__(self, name):
+        # Check if the attribute exists in the underlying dataset
+        if hasattr(self.dataset, name):
+            return getattr(self.dataset, name)
+        raise AttributeError(
+            f"'{type(self).__name__}' and its underlying dataset have no attribute '{name}'"
+        )
 
 
 class DataModule(LightningDataModule):
@@ -28,10 +57,15 @@ class DataModule(LightningDataModule):
                     self.hparams["force_files"],
                 )
             else:
+                dataset_arg = {}
+                if self.hparams["dataset_arg"] is not None:
+                    dataset_arg = self.hparams["dataset_arg"]
                 self.dataset = getattr(datasets, self.hparams["dataset"])(
-                    self.hparams["dataset_root"],
-                    dataset_arg=self.hparams["dataset_arg"],
+                    self.hparams["dataset_root"], **dataset_arg
                 )
+        self.dataset = FloatCastDatasetWrapper(
+            self.dataset, dtype_mapping[self.hparams["precision"]]
+        )
 
         self.idx_train, self.idx_val, self.idx_test = make_splits(
             len(self.dataset),
@@ -60,7 +94,7 @@ class DataModule(LightningDataModule):
         loaders = [self._get_dataloader(self.val_dataset, "val")]
         if (
             len(self.test_dataset) > 0
-            and self.trainer.current_epoch % self.hparams["test_interval"] == 0
+            and (self.trainer.current_epoch + 1) % self.hparams["test_interval"] == 0
         ):
             loaders.append(self._get_dataloader(self.test_dataset, "test"))
         return loaders
@@ -112,7 +146,7 @@ class DataModule(LightningDataModule):
 
     def _standardize(self):
         def get_energy(batch, atomref):
-            if batch.y is None:
+            if "y" not in batch or batch.y is None:
                 raise MissingEnergyException()
 
             if atomref is None:

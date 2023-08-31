@@ -1,6 +1,7 @@
 import math
-from typing import Optional
+from typing import Optional, Tuple
 import torch
+from torch import Tensor
 from torch import nn
 import torch.nn.functional as F
 from torch_geometric.nn import MessagePassing
@@ -40,11 +41,24 @@ def visualize_basis(basis_type, num_rbf=50, cutoff_lower=0, cutoff_upper=5):
 
 
 class NeighborEmbedding(MessagePassing):
-    def __init__(self, hidden_channels, num_rbf, cutoff_lower, cutoff_upper, max_z=100):
+    def __init__(self, hidden_channels, num_rbf, cutoff_lower, cutoff_upper, max_z=100, dtype=torch.float32):
+        """
+        The ET architecture assigns two  learned vectors to each atom type
+        zi. One  is used to  encode information  specific to an  atom, the
+        other (this  class) takes  the role  of a  neighborhood embedding.
+        The neighborhood embedding, which is  an embedding of the types of
+        neighboring atoms, is multiplied by a distance filter.
+
+
+        This embedding allows  the network to store  information about the
+        interaction of atom pairs.
+
+        See eq. 3 in https://arxiv.org/pdf/2202.02541.pdf for more details.
+        """
         super(NeighborEmbedding, self).__init__(aggr="add")
-        self.embedding = nn.Embedding(max_z, hidden_channels)
-        self.distance_proj = nn.Linear(num_rbf, hidden_channels)
-        self.combine = nn.Linear(hidden_channels * 2, hidden_channels)
+        self.embedding = nn.Embedding(max_z, hidden_channels, dtype=dtype)
+        self.distance_proj = nn.Linear(num_rbf, hidden_channels, dtype=dtype)
+        self.combine = nn.Linear(hidden_channels * 2, hidden_channels, dtype=dtype)
         self.cutoff = CosineCutoff(cutoff_lower, cutoff_upper)
 
         self.reset_parameters()
@@ -56,7 +70,24 @@ class NeighborEmbedding(MessagePassing):
         self.distance_proj.bias.data.fill_(0)
         self.combine.bias.data.fill_(0)
 
-    def forward(self, z, x, edge_index, edge_weight, edge_attr):
+    def forward(
+        self,
+        z: Tensor,
+        x: Tensor,
+        edge_index: Tensor,
+        edge_weight: Tensor,
+        edge_attr: Tensor,
+    ):
+        """
+        Args:
+            z (Tensor): Atomic numbers of shape :obj:`[num_nodes]`
+            x (Tensor): Node feature matrix (atom positions) of shape :obj:`[num_nodes, 3]`
+            edge_index (Tensor): Graph connectivity (list of neighbor pairs) with shape :obj:`[2, num_edges]`
+            edge_weight (Tensor): Edge weight vector of shape :obj:`[num_edges]`
+            edge_attr (Tensor): Edge attribute matrix of shape :obj:`[num_edges, 3]`
+        Returns:
+            x_neighbors (Tensor): The embedding of the neighbors of each atom of shape :obj:`[num_nodes, hidden_channels]`
+        """
         # remove self loops
         mask = edge_index[0] != edge_index[1]
         if not mask.all():
@@ -76,15 +107,171 @@ class NeighborEmbedding(MessagePassing):
     def message(self, x_j, W):
         return x_j * W
 
+class OptimizedDistance(torch.nn.Module):
+    def __init__(
+        self,
+        cutoff_lower=0.0,
+        cutoff_upper=5.0,
+        max_num_pairs=-32,
+        return_vecs=False,
+        loop=False,
+        strategy="brute",
+        include_transpose=True,
+        resize_to_fit=True,
+        check_errors=True,
+        box=None,
+    ):
+        super(OptimizedDistance, self).__init__()
+        """ Compute the neighbor list for a given cutoff.
+        This operation can be placed inside a CUDA graph in some cases.
+        In particular, resize_to_fit and check_errors must be False.
+        Note that this module returns neighbors such that distance(i,j) >= cutoff_lower and distance(i,j) < cutoff_upper.
+        This function optionally supports periodic boundary conditions with
+        arbitrary triclinic boxes.  The box vectors `a`, `b`, and `c` must satisfy
+        certain requirements:
+
+        `a[1] = a[2] = b[2] = 0`
+        `a[0] >= 2*cutoff, b[1] >= 2*cutoff, c[2] >= 2*cutoff`
+        `a[0] >= 2*b[0]`
+        `a[0] >= 2*c[0]`
+        `b[1] >= 2*c[1]`
+
+        These requirements correspond to a particular rotation of the system and
+        reduced form of the vectors, as well as the requirement that the cutoff be
+        no larger than half the box width.
+
+        Parameters
+        ----------
+        cutoff_lower : float
+            Lower cutoff for the neighbor list.
+        cutoff_upper : float
+            Upper cutoff for the neighbor list.
+        max_num_pairs : int
+            Maximum number of pairs to store, if the number of pairs found is less than this, the list is padded with (-1,-1) pairs up to max_num_pairs unless resize_to_fit is True, in which case the list is resized to the actual number of pairs found.
+            If the number of pairs found is larger than this, the pairs are randomly sampled. When check_errors is True, an exception is raised in this case.
+            If negative, it is interpreted as (minus) the maximum number of neighbors per atom.
+        strategy : str
+            Strategy to use for computing the neighbor list. Can be one of
+            ["shared", "brute", "cell"].
+            Shared: An O(N^2) algorithm that leverages CUDA shared memory, best for large number of particles.
+            Brute: A brute force O(N^2) algorithm, best for small number of particles.
+            Cell:  A cell list algorithm, best for large number of particles, low cutoffs and low batch size.
+        box : torch.Tensor, optional
+            The vectors defining the periodic box.  This must have shape `(3, 3)`,
+            where `box_vectors[0] = a`, `box_vectors[1] = b`, and `box_vectors[2] = c`.
+            If this is omitted, periodic boundary conditions are not applied.
+        loop : bool, optional
+            Whether to include self-interactions.
+            Default: False
+        include_transpose : bool, optional
+            Whether to include the transpose of the neighbor list.
+            Default: True
+        resize_to_fit : bool, optional
+            Whether to resize the neighbor list to the actual number of pairs found. When False, the list is padded with (-1,-1) pairs up to max_num_pairs
+            Default: True
+            If this is True the operation is not CUDA graph compatible.
+        check_errors : bool, optional
+            Whether to check for too many pairs. If this is True the operation is not CUDA graph compatible.
+            Default: True
+        return_vecs : bool, optional
+            Whether to return the distance vectors.
+            Default: False
+        """
+        self.cutoff_upper = cutoff_upper
+        self.cutoff_lower = cutoff_lower
+        self.max_num_pairs = max_num_pairs
+        self.strategy = strategy
+        self.box: Optional[Tensor] = box
+        self.loop = loop
+        self.return_vecs = return_vecs
+        self.include_transpose = include_transpose
+        self.resize_to_fit = resize_to_fit
+        self.use_periodic = True
+        if self.box is None:
+            self.use_periodic = False
+            self.box = torch.empty((0, 0))
+            if self.strategy == "cell":
+                # Default the box to 3 times the cutoff, really inefficient for the cell list
+                lbox = cutoff_upper * 3.0
+                self.box = torch.tensor([[lbox, 0, 0], [0, lbox, 0], [0, 0, lbox]])
+        self.box = self.box.cpu()  # All strategies expect the box to be in CPU memory
+        self.check_errors = check_errors
+        from torchmdnet.neighbors import get_neighbor_pairs_kernel
+        self.kernel = get_neighbor_pairs_kernel;
+
+    def forward(
+        self, pos: Tensor, batch: Optional[Tensor] = None
+    ) -> Tuple[Tensor, Tensor, Optional[Tensor]]:
+        """Compute the neighbor list for a given cutoff.
+        Parameters
+        ----------
+        pos : torch.Tensor
+            shape (N, 3)
+        batch : torch.Tensor or None
+            shape (N,)
+        Returns
+        -------
+        edge_index : torch.Tensor
+          List of neighbors for each atom in the batch.
+        shape (2, num_found_pairs or max_num_pairs)
+        edge_weight : torch.Tensor
+            List of distances for each atom in the batch.
+        shape (num_found_pairs or max_num_pairs,)
+        edge_vec : torch.Tensor
+            List of distance vectors for each atom in the batch.
+        shape (num_found_pairs or max_num_pairs, 3)
+
+        If resize_to_fit is True, the tensors will be trimmed to the actual number of pairs found.
+        otherwise the tensors will have size max_num_pairs, with neighbor pairs (-1, -1) at the end.
+
+        """
+        self.box = self.box.to(pos.dtype)
+        max_pairs = self.max_num_pairs
+        if self.max_num_pairs < 0:
+            max_pairs = -self.max_num_pairs * pos.shape[0]
+        if batch is None:
+            batch = torch.zeros(pos.shape[0], dtype=torch.long, device=pos.device)
+        edge_index, edge_vec, edge_weight, num_pairs = self.kernel(
+            strategy=self.strategy,
+            positions=pos,
+            batch=batch,
+            max_num_pairs=max_pairs,
+            cutoff_lower=self.cutoff_lower,
+            cutoff_upper=self.cutoff_upper,
+            loop=self.loop,
+            include_transpose=self.include_transpose,
+            box_vectors=self.box,
+            use_periodic=self.use_periodic,
+        )
+        if self.check_errors:
+            if num_pairs[0] > max_pairs:
+                raise RuntimeError(
+                    "Found num_pairs({}) > max_num_pairs({})".format(
+                        num_pairs[0], max_pairs
+                    )
+                )
+        edge_index = edge_index.to(torch.long)
+        # Remove (-1,-1)  pairs
+        if self.resize_to_fit:
+            mask = edge_index[0] != -1
+            edge_index = edge_index[:, mask]
+            edge_weight = edge_weight[mask]
+            edge_vec = edge_vec[mask, :]
+
+        if self.return_vecs:
+            return edge_index, edge_weight, edge_vec
+        else:
+            return edge_index, edge_weight, None
+
 
 class GaussianSmearing(nn.Module):
-    def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0, num_rbf=50, trainable=True):
+    def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0, num_rbf=50, trainable=True, dtype=torch.float32):
         super(GaussianSmearing, self).__init__()
         self.cutoff_lower = cutoff_lower
         self.cutoff_upper = cutoff_upper
         self.num_rbf = num_rbf
         self.trainable = trainable
-
+        self.dtype = dtype
         offset, coeff = self._initial_params()
         if trainable:
             self.register_parameter("coeff", nn.Parameter(coeff))
@@ -94,7 +281,7 @@ class GaussianSmearing(nn.Module):
             self.register_buffer("offset", offset)
 
     def _initial_params(self):
-        offset = torch.linspace(self.cutoff_lower, self.cutoff_upper, self.num_rbf)
+        offset = torch.linspace(self.cutoff_lower, self.cutoff_upper, self.num_rbf, dtype=self.dtype)
         coeff = -0.5 / (offset[1] - offset[0]) ** 2
         return offset, coeff
 
@@ -109,13 +296,13 @@ class GaussianSmearing(nn.Module):
 
 
 class ExpNormalSmearing(nn.Module):
-    def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0, num_rbf=50, trainable=True):
+    def __init__(self, cutoff_lower=0.0, cutoff_upper=5.0, num_rbf=50, trainable=True, dtype=torch.float32):
         super(ExpNormalSmearing, self).__init__()
         self.cutoff_lower = cutoff_lower
         self.cutoff_upper = cutoff_upper
         self.num_rbf = num_rbf
         self.trainable = trainable
-
+        self.dtype = dtype
         self.cutoff_fn = CosineCutoff(0, cutoff_upper)
         self.alpha = 5.0 / (cutoff_upper - cutoff_lower)
 
@@ -131,11 +318,11 @@ class ExpNormalSmearing(nn.Module):
         # initialize means and betas according to the default values in PhysNet
         # https://pubs.acs.org/doi/10.1021/acs.jctc.9b00181
         start_value = torch.exp(
-            torch.scalar_tensor(-self.cutoff_upper + self.cutoff_lower)
+            torch.scalar_tensor(-self.cutoff_upper + self.cutoff_lower, dtype=self.dtype)
         )
-        means = torch.linspace(start_value, 1, self.num_rbf)
+        means = torch.linspace(start_value, 1, self.num_rbf, dtype=self.dtype)
         betas = torch.tensor(
-            [(2 / self.num_rbf * (1 - start_value)) ** -2] * self.num_rbf
+            [(2 / self.num_rbf * (1 - start_value)) ** -2] * self.num_rbf, dtype=self.dtype
         )
         return means, betas
 
@@ -153,6 +340,12 @@ class ExpNormalSmearing(nn.Module):
 
 
 class ShiftedSoftplus(nn.Module):
+    r"""Applies the ShiftedSoftplus function :math:`\text{ShiftedSoftplus}(x) = \frac{1}{\beta} *
+    \log(1 + \exp(\beta * x))-\log(2)` element-wise.
+
+    SoftPlus is a smooth approximation to the ReLU function and can be used
+    to constrain the output of a machine to always be positive.
+    """
     def __init__(self):
         super(ShiftedSoftplus, self).__init__()
         self.shift = torch.log(torch.tensor(2.0)).item()
@@ -182,13 +375,13 @@ class CosineCutoff(nn.Module):
                 + 1.0
             )
             # remove contributions below the cutoff radius
-            cutoffs = cutoffs * (distances < self.cutoff_upper).float()
-            cutoffs = cutoffs * (distances > self.cutoff_lower).float()
+            cutoffs = cutoffs * (distances < self.cutoff_upper)
+            cutoffs = cutoffs * (distances > self.cutoff_lower)
             return cutoffs
         else:
             cutoffs = 0.5 * (torch.cos(distances * math.pi / self.cutoff_upper) + 1.0)
             # remove contributions beyond the cutoff radius
-            cutoffs = cutoffs * (distances < self.cutoff_upper).float()
+            cutoffs = cutoffs * (distances < self.cutoff_upper)
             return cutoffs
 
 
@@ -233,7 +426,9 @@ class Distance(nn.Module):
             # the norm of 0 produces NaN gradients
             # NOTE: might influence force predictions as self loop gradients are ignored
             mask = edge_index[0] != edge_index[1]
-            edge_weight = torch.zeros(edge_vec.size(0), device=edge_vec.device)
+            edge_weight = torch.zeros(
+                edge_vec.size(0), device=edge_vec.device, dtype=edge_vec.dtype
+            )
             edge_weight[mask] = torch.norm(edge_vec[mask], dim=-1)
         else:
             edge_weight = torch.norm(edge_vec, dim=-1)
@@ -265,6 +460,7 @@ class GatedEquivariantBlock(nn.Module):
         intermediate_channels=None,
         activation="silu",
         scalar_activation=False,
+        dtype=torch.float,
     ):
         super(GatedEquivariantBlock, self).__init__()
         self.out_channels = out_channels
@@ -272,14 +468,14 @@ class GatedEquivariantBlock(nn.Module):
         if intermediate_channels is None:
             intermediate_channels = hidden_channels
 
-        self.vec1_proj = nn.Linear(hidden_channels, hidden_channels, bias=False)
-        self.vec2_proj = nn.Linear(hidden_channels, out_channels, bias=False)
+        self.vec1_proj = nn.Linear(hidden_channels, hidden_channels, bias=False, dtype=dtype)
+        self.vec2_proj = nn.Linear(hidden_channels, out_channels, bias=False, dtype=dtype)
 
         act_class = act_class_mapping[activation]
         self.update_net = nn.Sequential(
-            nn.Linear(hidden_channels * 2, intermediate_channels),
+            nn.Linear(hidden_channels * 2, intermediate_channels, dtype=dtype),
             act_class(),
-            nn.Linear(intermediate_channels, out_channels * 2),
+            nn.Linear(intermediate_channels, out_channels * 2, dtype=dtype),
         )
 
         self.act = act_class() if scalar_activation else None
@@ -297,7 +493,7 @@ class GatedEquivariantBlock(nn.Module):
 
         # detach zero-entries to avoid NaN gradients during force loss backpropagation
         vec1 = torch.zeros(
-            vec1_buffer.size(0), vec1_buffer.size(2), device=vec1_buffer.device
+            vec1_buffer.size(0), vec1_buffer.size(2), device=vec1_buffer.device, dtype=vec1_buffer.dtype
         )
         mask = (vec1_buffer != 0).view(vec1_buffer.size(0), -1).any(dim=1)
         if not mask.all():
@@ -329,3 +525,5 @@ act_class_mapping = {
     "tanh": nn.Tanh,
     "sigmoid": nn.Sigmoid,
 }
+
+dtype_mapping = {16: torch.float16, 32: torch.float, 64: torch.float64}
